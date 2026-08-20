@@ -11,7 +11,6 @@ from google.genai import types
 import edge_tts
 import static_ffmpeg
 static_ffmpeg.add_paths()
-from static_ffmpeg.run import get_ffmpeg_executable  # <── ДОДАЙТЕ ЦЕЙ РЯДОК
 
 # ── Завантаження Opus для голосових функцій ─────────────────────────────────
 # Цей блок примусово завантажує Opus у Linux / Docker системах
