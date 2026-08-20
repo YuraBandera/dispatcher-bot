@@ -11,6 +11,8 @@ from google import genai
 from google.genai import types
 import edge_tts
 import static_ffmpeg
+
+# Примусово ініціалізуємо та додаємо шляхи static_ffmpeg
 static_ffmpeg.add_paths()
 
 # ── Конфігурація ───────────────────────────────────────────────────────────
@@ -64,20 +66,24 @@ SAFETY_SETTINGS = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dispatcher")
 
-# ── Допоміжний пошук FFmpeg бінарника ─────────────────────────────────────────
-def get_ffmpeg_path() -> str:
-    path = shutil.which("ffmpeg")
-    if path:
-        return path
+
+def get_ffmpeg_executable() -> str:
+    """Знаходить точний абсолютний шлях до ffmpeg у системі або в static_ffmpeg."""
+    # 1. Спроба через static_ffmpeg get_or_fetch
     try:
         ffmpeg_bin, _ = static_ffmpeg.run.get_or_fetch_platform_executables_else_raise()
         if ffmpeg_bin and os.path.exists(ffmpeg_bin):
             return ffmpeg_bin
-    except Exception as e:
-        log.warning(f"Не вдалося знайти бінарник через static_ffmpeg: {e}")
+    except Exception:
+        pass
+
+    # 2. Перевірка системного PATH
+    sys_path = shutil.which("ffmpeg")
+    if sys_path:
+        return sys_path
+
     return "ffmpeg"
 
-FFMPEG_EXECUTABLE = get_ffmpeg_path()
 
 # ── Ініціалізація клієнтів ─────────────────────────────────────────────────
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -148,12 +154,12 @@ async def ask_gemini(chat, text: str) -> str:
 
 
 async def play_voice_alert(report_text: str, disp: dict):
-    print(f"\n--- [VOICE START] Початок обробки войсу ---")
+    print("\n--- [VOICE START] Початок обробки войсу ---")
     if not PATROL_VOICE_CHANNEL_IDS:
         print("[VOICE ERROR] PATROL_VOICE_CHANNEL_IDS порожній!")
         return
 
-    # 1. Пошук каналів з людьми
+    # 1. Пошук каналів з реальними людьми
     target_channels = []
     for ch_id in PATROL_VOICE_CHANNEL_IDS:
         ch = bot.get_channel(ch_id)
@@ -177,7 +183,7 @@ async def play_voice_alert(report_text: str, disp: dict):
             print("[VOICE ERROR] Голосових каналів не знайдено.")
             return
 
-    # 2. Формування тексту і генерація MP3
+    # 2. Формування тексту та генерація TTS
     clean_text = re.sub(r"[•*#_`]", "", report_text)
     speech_text = (
         f"Увага всім патрулям! Говорить черговий диспетчер {disp['name']}. "
@@ -190,15 +196,11 @@ async def play_voice_alert(report_text: str, disp: dict):
         communicate = edge_tts.Communicate(speech_text, disp["voice"], rate="+5%")
         await communicate.save(temp_audio)
 
-        file_size = os.path.getsize(temp_audio) if os.path.exists(temp_audio) else 0
-        print(f"[VOICE] Аудіофайл створено ({file_size} байт).")
-
-        if file_size == 0:
-            print("[VOICE ERROR] Аудіофайл нульового розміру!")
-            return
+        ffmpeg_bin = get_ffmpeg_executable()
+        print(f"[VOICE] Використовується бінарник FFmpeg: {ffmpeg_bin}")
 
         for channel in target_channels:
-            print(f"[VOICE] Підключення до '{channel.name}'...")
+            print(f"[VOICE] Спроба підключення до '{channel.name}'...")
             try:
                 vc = None
                 for client in bot.voice_clients:
@@ -211,33 +213,30 @@ async def play_voice_alert(report_text: str, disp: dict):
                 elif vc.channel.id != channel.id:
                     await vc.move_to(channel)
 
-                # Невелика пауза для стабілізації Voice Handshake
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
 
                 if vc.is_playing():
                     vc.stop()
 
-                # Подія завершення відтворення
                 play_done = asyncio.Event()
 
                 def after_playback(error):
                     if error:
-                        print(f"[VOICE ERROR CALLBACK] Помилка відтворення: {error}")
+                        print(f"[VOICE ERROR] Помилка відтворення: {error}")
                     else:
-                        print(f"[VOICE] Аудіо успішно зіграно в '{channel.name}'.")
+                        print(f"[VOICE] Відтворення успішно завершено.")
                     bot.loop.call_soon_threadsafe(play_done.set)
 
                 audio_source = discord.FFmpegPCMAudio(
                     temp_audio,
-                    executable=FFMPEG_EXECUTABLE,
+                    executable=ffmpeg_bin,
                     options='-vn -filter:a "volume=1.3"'
                 )
                 audio_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
 
-                print(f"[VOICE] Початок мовлення у '{channel.name}'...")
+                print(f"[VOICE] Програвання аудіо у '{channel.name}'...")
                 vc.play(audio_source, after=after_playback)
 
-                # Чекаємо поки звук реально закінчиться
                 try:
                     await asyncio.wait_for(play_done.wait(), timeout=60.0)
                 except asyncio.TimeoutError:
@@ -246,16 +245,16 @@ async def play_voice_alert(report_text: str, disp: dict):
                 await asyncio.sleep(1.0)
 
             except Exception as err:
-                print(f"[VOICE CHANNEL ERROR] {channel.name}: {err}")
+                print(f"[VOICE ERROR] Помилка у каналі '{channel.name}': {err}")
                 log.exception("Voice Playback Exception")
 
-        # Відключення від войсів
+        # Відключення
         for client in list(bot.voice_clients):
             try:
                 await client.disconnect(force=True)
             except Exception:
                 pass
-        print("[VOICE] Бот відключився від голосових.\n--- [VOICE END] ---")
+        print("[VOICE] Бот відключився від усіх голосових каналів.\n--- [VOICE END] ---")
 
     except Exception as err:
         print(f"[VOICE CRITICAL ERROR]: {err}")
@@ -270,7 +269,6 @@ async def play_voice_alert(report_text: str, disp: dict):
 
 async def monitor_callout_lifecycle(report_message: discord.Message, report: str):
     try:
-        # 1. Очікування взяття виклику патрулем
         def check_take(reaction: discord.Reaction, user: discord.User):
             return (
                 reaction.message.id == report_message.id
@@ -280,7 +278,6 @@ async def monitor_callout_lifecycle(report_message: discord.Message, report: str
 
         reaction, officer = await bot.wait_for("reaction_add", check=check_take)
 
-        # Оновлення картки: виклик у роботі
         await report_message.clear_reactions()
         await report_message.edit(
             content=(
@@ -291,7 +288,6 @@ async def monitor_callout_lifecycle(report_message: discord.Message, report: str
         )
         await report_message.add_reaction("🏁")
 
-        # 2. Очікування закриття виклику
         def check_finish(reaction: discord.Reaction, user: discord.User):
             return (
                 reaction.message.id == report_message.id
@@ -301,7 +297,6 @@ async def monitor_callout_lifecycle(report_message: discord.Message, report: str
 
         finish_reaction, closing_officer = await bot.wait_for("reaction_add", check=check_finish)
 
-        # Фінальне оновлення картки: виклик завершено
         await report_message.clear_reactions()
         await report_message.edit(
             content=(
@@ -315,7 +310,6 @@ async def monitor_callout_lifecycle(report_message: discord.Message, report: str
 
 
 async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, mention: str | None):
-    # 1. Відповідь громадянину в гілку і закриття лінії
     citizen_reply = (
         f"{mention or ''}\n🚔 **Інформацію прийнято та зареєстровано!** "
         f"Черговий екіпаж патрульної поліції вже направлено за вказаною адресою. "
@@ -328,10 +322,10 @@ async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, 
         pass
     sessions.pop(thread.id, None)
 
-    # 2. Запуск войсу у фоні
+    # Голосове сповіщення
     asyncio.create_task(play_voice_alert(report, disp))
 
-    # 3. Публікація картки виклику у фракційному каналі
+    # Текстова картка у фракційний канал
     faction_channel = bot.get_channel(FACTION_CHANNEL_ID)
     if faction_channel is None:
         faction_channel = await bot.fetch_channel(FACTION_CHANNEL_ID)
@@ -342,8 +336,6 @@ async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, 
         allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True)
     )
     await report_message.add_reaction("✅")
-
-    # 4. Фоновий запуск відстеження реакцій (щоб бот не блокував інші виклики)
     asyncio.create_task(monitor_callout_lifecycle(report_message, report))
 
 
