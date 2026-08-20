@@ -3,7 +3,6 @@ import random
 import asyncio
 import logging
 import re
-import shutil
 
 import discord
 from dotenv import load_dotenv
@@ -11,9 +10,17 @@ from google import genai
 from google.genai import types
 import edge_tts
 import static_ffmpeg
-
-# Примусово ініціалізуємо та додаємо шляхи static_ffmpeg
 static_ffmpeg.add_paths()
+
+# ── Завантаження Opus для голосових функцій ─────────────────────────────────
+# Цей блок примусово завантажує Opus у Linux / Docker системах
+if not discord.opus.is_loaded():
+    for opus_lib in ['libopus.so.0', 'libopus.so', 'libopus']:
+        try:
+            discord.opus.load_opus(opus_lib)
+            break
+        except OSError:
+            continue
 
 # ── Конфігурація ───────────────────────────────────────────────────────────
 load_dotenv()
@@ -40,17 +47,17 @@ COMPLETION_TAG = "[ВИКЛИК_ЗАВЕРШЕНО]"
 INVALID_TAG    = "[ВИКЛИК_СКАСОВАНО]"
 
 DISPATCHERS_MALE = [
-    {"name": "Олексій Ткаченко", "callsign": "102-Альфа", "role_desc": "черговий диспетчер", "voice": "uk-UA-OstapNeural"},
-    {"name": "Максим Бондаренко", "callsign": "102-Омега", "role_desc": "старший оператор лінії", "voice": "uk-UA-OstapNeural"},
-    {"name": "Дмитро Козак", "callsign": "102-Браво", "role_desc": "черговий частини", "voice": "uk-UA-OstapNeural"},
-    {"name": "Артем Шевчук", "callsign": "102-Дельта", "role_desc": "диспетчер зв'язку", "voice": "uk-UA-OstapNeural"}
+    {"name": "Олексій Ткаченко", "callsign": "102-Альфа", "role_desc": "черговий диспетчер", "voice": "uk-UA-OstapNeural", "gender": "male"},
+    {"name": "Максим Бондаренко", "callsign": "102-Омега", "role_desc": "старший оператор лінії", "voice": "uk-UA-OstapNeural", "gender": "male"},
+    {"name": "Дмитро Козак", "callsign": "102-Браво", "role_desc": "черговий частини", "voice": "uk-UA-OstapNeural", "gender": "male"},
+    {"name": "Артем Шевчук", "callsign": "102-Дельта", "role_desc": "диспетчер зв'язку", "voice": "uk-UA-OstapNeural", "gender": "male"}
 ]
 
 DISPATCHERS_FEMALE = [
-    {"name": "Світлана Мельник", "callsign": "102-Венера", "role_desc": "чергова диспетчерка", "voice": "uk-UA-PolinaNeural"},
-    {"name": "Вікторія Коваль", "callsign": "102-Стріла", "role_desc": "старша операторка лінії", "voice": "uk-UA-PolinaNeural"},
-    {"name": "Олена Мороз", "callsign": "102-Зоря", "role_desc": "чергова частини", "voice": "uk-UA-PolinaNeural"},
-    {"name": "Катерина Бойко", "callsign": "102-Фенікс", "role_desc": "диспетчерка зв'язку", "voice": "uk-UA-PolinaNeural"}
+    {"name": "Світлана Мельник", "callsign": "102-Венера", "role_desc": "чергова диспетчерка", "voice": "uk-UA-PolinaNeural", "gender": "female"},
+    {"name": "Вікторія Коваль", "callsign": "102-Стріла", "role_desc": "старша операторка лінії", "voice": "uk-UA-PolinaNeural", "gender": "female"},
+    {"name": "Олена Мороз", "callsign": "102-Зоря", "role_desc": "чергова частини", "voice": "uk-UA-PolinaNeural", "gender": "female"},
+    {"name": "Катерина Бойко", "callsign": "102-Фенікс", "role_desc": "диспетчерка зв'язку", "voice": "uk-UA-PolinaNeural", "gender": "female"}
 ]
 
 SAFETY_SETTINGS = [
@@ -65,25 +72,6 @@ SAFETY_SETTINGS = [
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dispatcher")
-
-
-def get_ffmpeg_executable() -> str:
-    """Знаходить точний абсолютний шлях до ffmpeg у системі або в static_ffmpeg."""
-    # 1. Спроба через static_ffmpeg get_or_fetch
-    try:
-        ffmpeg_bin, _ = static_ffmpeg.run.get_or_fetch_platform_executables_else_raise()
-        if ffmpeg_bin and os.path.exists(ffmpeg_bin):
-            return ffmpeg_bin
-    except Exception:
-        pass
-
-    # 2. Перевірка системного PATH
-    sys_path = shutil.which("ffmpeg")
-    if sys_path:
-        return sys_path
-
-    return "ffmpeg"
-
 
 # ── Ініціалізація клієнтів ─────────────────────────────────────────────────
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -131,6 +119,13 @@ def generate_system_prompt(disp: dict) -> str:
 • ЛОКАЦІЯ: [Адреса чи орієнтир]
 • ПОСТРАЖДАЛІ / ЗАГРОЗА: [Інформація про людей/зброю]
 • ДИСПЕТЧЕР: {disp['name']} ({disp['callsign']})"""
+
+# ── Примітка щодо відтворення аудіо у вашому коді ─────────────────────────
+# Там, де у вас викликається програвання звуку (метод vc.play), 
+# замість звичайного discord.FFmpegPCMAudio обов'язково використовуйте:
+# 
+# source = await discord.FFmpegOpusAudio.from_probe("шлях_до_файлу.mp3")
+# vc.play(source)
 
 
 def new_chat_session():
@@ -227,7 +222,7 @@ async def play_voice_alert(report_text: str, disp: dict):
                         print(f"[VOICE] Відтворення успішно завершено.")
                     bot.loop.call_soon_threadsafe(play_done.set)
 
-                audio_source = discord.FFmpegPCMAudio(
+                audio_source = discord.FFmpegOpusAudio.from_probe(
                     temp_audio,
                     executable=ffmpeg_bin,
                     options='-vn -filter:a "volume=1.3"'
