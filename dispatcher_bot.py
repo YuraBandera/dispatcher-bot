@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 import edge_tts
+import static_ffmpeg
+static_ffmpeg.add_paths()
 
 # ── Конфігурація ───────────────────────────────────────────────────────────
 load_dotenv()
