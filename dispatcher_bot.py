@@ -31,9 +31,8 @@ PATROL_VOICE_CHANNEL_IDS = [
     int(ch_id.strip()) for ch_id in _voice_raw if ch_id.strip().isdigit()
 ]
 
-COMPLETION_TAG   = "[ВИКЛИК_ЗАВЕРШЕНО]"
-INVALID_TAG      = "[ВИКЛИК_СКАСОВАНО]"
-REACTION_TIMEOUT = 120
+COMPLETION_TAG = "[ВИКЛИК_ЗАВЕРШЕНО]"
+INVALID_TAG    = "[ВИКЛИК_СКАСОВАНО]"
 
 DISPATCHERS_MALE = [
     {"name": "Олексій Ткаченко", "callsign": "102-Альфа", "role_desc": "черговий диспетчер", "voice": "uk-UA-OstapNeural"},
@@ -65,12 +64,7 @@ log = logging.getLogger("dispatcher")
 # ── Ініціалізація клієнтів ─────────────────────────────────────────────────
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.reactions = True
-intents.guilds = True
-intents.members = True
-intents.voice_states = True
+intents = discord.Intents.all()
 bot = discord.Client(intents=intents)
 
 sessions: dict[int, dict] = {}
@@ -88,10 +82,10 @@ def generate_system_prompt(disp: dict) -> str:
 Твоє ім'я: {disp['name']}.
 Твій статус/посада: {disp['role_desc']} (Позивний: {disp['callsign']}).
 
-ВАЖЛИВО ПРО СТАТЬ ТА МОВУ:
+ВАЖЛИВО:
 - {gender_rules}
 - Спілкуйся виключно українською мовою.
-- Не говори як сухий скрипт чи робот. Говори чітко й зібрано.
+- Не говори як сухий скрипт чи робот. Говори чітко, швидко й зібрано.
 
 ТВОЄ ЗАВДАННЯ — ОПЕРАТИВНО ЗІБРАТИ 4 ПУНКТИ:
 1. Що сталося (суть правопорушення).
@@ -136,76 +130,90 @@ async def ask_gemini(chat, text: str) -> str:
 
 
 async def play_voice_alert(report_text: str, disp: dict):
-    print(f"[VOICE] Початок обробки голосового сповіщення. Канали: {PATROL_VOICE_CHANNEL_IDS}")
+    print(f"\n--- [VOICE START] Початок обробки войсу ---")
+    print(f"[VOICE] Налаштовані ID каналів: {PATROL_VOICE_CHANNEL_IDS}")
+    
     if not PATROL_VOICE_CHANNEL_IDS:
-        print("[VOICE ERROR] Список PATROL_VOICE_CHANNEL_IDS порожній!")
+        print("[VOICE ERROR] Список PATROL_VOICE_CHANNEL_IDS порожній! Перевір змінні в Railway.")
         return
 
-    # Збираємо всі канали, де сидять користувачі
-    active_channels: list[discord.VoiceChannel] = []
-    for ch_id in PATROL_VOICE_CHANNEL_IDS:
-        ch = bot.get_channel(ch_id)
-        if ch is None:
-            try:
-                ch = await bot.fetch_channel(ch_id)
-            except Exception as e:
-                print(f"[VOICE ERROR] Не вдалося отримати канал {ch_id}: {e}")
-                continue
+    # 1. Пошук каналів та перевірка наявності людей
+    target_channels = []
+    for guild in bot.guilds:
+        for vc_channel in guild.voice_channels:
+            if vc_channel.id in PATROL_VOICE_CHANNEL_IDS:
+                humans = [m for m in vc_channel.members if not m.bot]
+                print(f"[VOICE] Знайдено канал '{vc_channel.name}' (ID: {vc_channel.id}). Людей: {len(humans)}")
+                if humans:
+                    target_channels.append(vc_channel)
 
-        if isinstance(ch, discord.VoiceChannel):
-            humans = [m for m in ch.members if not m.bot]
-            print(f"[VOICE] Канал '{ch.name}' (ID: {ch.id}) — людей всередині: {len(humans)}")
-            if humans:
-                active_channels.append(ch)
+    # Якщо людей не знайдено, але канали є — підключаємося до першого налаштованого для гарантованого сповіщення
+    if not target_channels:
+        first_id = PATROL_VOICE_CHANNEL_IDS[0]
+        ch = bot.get_channel(first_id)
+        if ch and isinstance(ch, discord.VoiceChannel):
+            print(f"[VOICE] У каналах пусто, але виконуємо сповіщення у головний патрульний канал: {ch.name}")
+            target_channels.append(ch)
+        else:
+            print("[VOICE ERROR] Не вдалося знайти жодного дійсного голосового каналу.")
+            return
 
-    if not active_channels:
-        print("[VOICE] Жоден патрульний голосовий канал не зайнятий. Пропуск аудіо.")
-        return
-
+    # 2. Підготовка тексту і TTS
     clean_text = re.sub(r"[•*]", "", report_text)
     speech_text = (
         f"Увага всім екіпажам! Говорить диспетчер {disp['name']}. "
         f"Надійшов новий виклик: {clean_text}. Прийміть картку в каналі зв'язку."
     )
 
-    temp_audio = f"voice_alert_{random.randint(10000, 99999)}.mp3"
+    temp_audio = f"voice_{random.randint(10000, 99999)}.mp3"
     try:
-        print(f"[VOICE] Генерація TTS файлу через {disp['voice']}...")
+        print(f"[VOICE] Генерація TTS через edge-tts ({disp['voice']})...")
         communicate = edge_tts.Communicate(speech_text, disp["voice"])
         await communicate.save(temp_audio)
-        print("[VOICE] TTS файл створено успішно.")
+        print("[VOICE] Аудіофайл успішно згенеровано.")
 
-        for channel in active_channels:
+        for channel in target_channels:
+            print(f"[VOICE] Спроба підключення до '{channel.name}'...")
+            vc = None
             try:
-                print(f"[VOICE] Підключення до голосового каналу '{channel.name}'...")
-                vc = channel.guild.voice_client
-                if vc is None:
-                    vc = await channel.connect(timeout=15.0, reconnect=True)
+                # Перевіряємо, чи бот уже підключений до голосових на сервері
+                for client in bot.voice_clients:
+                    if client.guild.id == channel.guild.id:
+                        vc = client
+                        break
+
+                if vc is None or not vc.is_connected():
+                    vc = await channel.connect(timeout=20.0, reconnect=True)
                 elif vc.channel.id != channel.id:
                     await vc.move_to(channel)
 
                 if vc.is_playing():
                     vc.stop()
 
-                print(f"[VOICE] Відтворення сповіщення в '{channel.name}'...")
+                print(f"[VOICE] Програвання аудіо у '{channel.name}'...")
                 vc.play(discord.FFmpegPCMAudio(temp_audio))
+                
                 while vc.is_playing():
                     await asyncio.sleep(0.5)
-                print(f"[VOICE] Відтворення у '{channel.name}' завершено.")
 
-            except Exception as err:
-                print(f"[VOICE ERROR] Помилка під час відтворення у каналі {channel.id}: {err}")
-                log.exception("Voice channel playback error")
+                print(f"[VOICE] Програвання у '{channel.name}' успішно завершено.")
+                await asyncio.sleep(1.0)
 
-        # Відключаємося після сповіщення всіх зайнятих каналів
-        for vc in bot.voice_clients:
-            if vc.is_connected():
-                await vc.disconnect()
-        print("[VOICE] Робота з войсом успішно завершена.")
+            except Exception as e:
+                print(f"[VOICE ERROR] Помилка у каналі '{channel.name}': {e}")
+                log.exception("Voice Playback Exception")
 
-    except Exception as err:
-        print(f"[VOICE CRITICAL ERROR] Загальна помилка: {err}")
-        log.exception("TTS/Voice general failure")
+        # Відключення
+        for client in list(bot.voice_clients):
+            try:
+                await client.disconnect(force=True)
+            except Exception:
+                pass
+        print("[VOICE] Бот відключився від усіх голосових каналів.\n--- [VOICE END] ---")
+
+    except Exception as e:
+        print(f"[VOICE CRITICAL ERROR] Загальна помилка войсу: {e}")
+        log.exception("Voice Critical Exception")
     finally:
         if os.path.exists(temp_audio):
             try:
@@ -215,56 +223,74 @@ async def play_voice_alert(report_text: str, disp: dict):
 
 
 async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, mention: str | None):
+    # 1. Відповідь громадянину в гілку і миттєве закриття лінії
+    citizen_reply = (
+        f"{mention or ''}\n🚔 **Інформацію прийнято та зареєстровано!** "
+        f"Черговий екіпаж патрульної поліції вже направлено за вказаною адресою. "
+        f"Залишайтеся в безпечному місці та очікуйте на прибуття співробітників."
+    )
+    await thread.send(citizen_reply)
+    try:
+        await thread.edit(archived=True, locked=True)
+    except discord.HTTPException:
+        pass
+    sessions.pop(thread.id, None)
+
+    # 2. Запуск войсу у фоні
+    asyncio.create_task(play_voice_alert(report, disp))
+
+    # 3. Публікація картки виклику у фракційному каналі
     faction_channel = bot.get_channel(FACTION_CHANNEL_ID)
     if faction_channel is None:
         faction_channel = await bot.fetch_channel(FACTION_CHANNEL_ID)
 
-    # 1. Запуск голосового сповіщення у фоні
-    asyncio.create_task(play_voice_alert(report, disp))
-
-    # 2. Публікація картки виклику для патрульних
     header = f"<@&{ROLE_ID_TO_PING}>\n🚨 **НОВИЙ ВИКЛИК 102 — ОПЕРАТИВНЕ РЕАГУВАННЯ**\n\n"
     report_message = await faction_channel.send(
-        header + report + "\n\n*(Натисніть ✅, щоб прийняти виклик)*",
+        header + report + "\n\n*(Натисніть ✅, щоб закріпити виклик за собою)*",
         allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True)
     )
     await report_message.add_reaction("✅")
 
-    def check_reaction(reaction: discord.Reaction, user: discord.User):
+    # 4. Нескінченне очікування взяття виклику екіпажем
+    def check_take(reaction: discord.Reaction, user: discord.User):
         return (
             reaction.message.id == report_message.id
             and str(reaction.emoji) == "✅"
             and not user.bot
         )
 
-    try:
-        reaction, user = await bot.wait_for("reaction_add", timeout=REACTION_TIMEOUT, check=check_reaction)
+    reaction, officer = await bot.wait_for("reaction_add", check=check_take)
 
-        await report_message.edit(
-            content=f"🟢 **ВИКЛИК ПРИЙНЯТО: {user.mention}**\n\n{report}"
+    # Оновлення картки: виклик в роботі
+    await report_message.clear_reactions()
+    await report_message.edit(
+        content=(
+            f"🟡 **ВИКЛИК В РОБОТІ: {officer.mention}**\n\n"
+            f"{report}\n\n"
+            f"*(Після завершення ситуації натисніть 🏁 для закриття картки)*"
         )
-        closing_msg = (
-            f"{mention or ''}\n🚔 **Екіпаж патрульної поліції ({user.display_name}) прийняв Ваш виклик і прямує за вказаною адресою.** "
-            f"Залишайтеся в безпечному місці до прибуття поліції."
-        )
-        await thread.send(closing_msg)
+    )
+    await report_message.add_reaction("🏁")
 
-    except asyncio.TimeoutError:
-        await report_message.edit(
-            content=f"🔴 **НЕМАЄ РЕАГУВАННЯ (ТАЙМАУТ)**\n\n{report}"
+    # 5. Нескінченне очікування завершення виклику екіпажем
+    def check_finish(reaction: discord.Reaction, user: discord.User):
+        return (
+            reaction.message.id == report_message.id
+            and str(reaction.emoji) == "🏁"
+            and not user.bot
         )
-        timeout_msg = (
-            f"{mention or ''}\n❌ **На жаль, наразі всі вільні екіпажі зайняті або відсутні на лінії реагування.** "
-            f"Заяву внесено до журналу обліку. За потреби зверніться до найближчого відділку поліції."
-        )
-        await thread.send(timeout_msg)
 
-    finally:
-        try:
-            await thread.edit(archived=True, locked=True)
-        except discord.HTTPException:
-            pass
-        sessions.pop(thread.id, None)
+    finish_reaction, closing_officer = await bot.wait_for("reaction_add", check=check_finish)
+
+    # Фінальне оновлення картки: виклик завершено
+    await report_message.clear_reactions()
+    await report_message.edit(
+        content=(
+            f"🟢 **ВИКЛИК УСПІШНО ЗАВЕРШЕНО: {closing_officer.mention}**\n\n"
+            f"{report}\n\n"
+            f"*(Картку переміщено в архів)*"
+        )
+    )
 
 
 async def process_turn(thread: discord.Thread, user_text: str, mention: str | None):
@@ -291,8 +317,6 @@ async def process_turn(thread: discord.Thread, user_text: str, mention: str | No
 
         if COMPLETION_TAG in reply:
             report = reply.replace(COMPLETION_TAG, "").strip()
-            # Повідомлення без скидання слухавки
-            await thread.send("Інформацію прийнято. Залишайтеся на зв'язку, формую картку та передаю вільним екіпажам...")
             await handle_call_dispatch(thread, report, disp, mention)
 
         elif INVALID_TAG in reply:
@@ -300,7 +324,7 @@ async def process_turn(thread: discord.Thread, user_text: str, mention: str | No
             if msg:
                 await thread.send(msg)
             hung_up = "*Скинув слухавку.*" if disp["gender"] == "male" else "*Скинула слухавку.*"
-            await thread.send(f"Зв'язок примусово розірвано черговою частиною через некоректний виклик. {hung_up}")
+            await thread.send(f"Зв'язок розірвано. {hung_up}")
             try:
                 await thread.edit(archived=True, locked=True)
             except discord.HTTPException:
