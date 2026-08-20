@@ -133,76 +133,100 @@ async def ask_gemini(chat, text: str) -> str:
 
 async def play_voice_alert(report_text: str, disp: dict):
     print(f"\n--- [VOICE START] Початок обробки войсу ---")
-    print(f"[VOICE] Налаштовані ID каналів: {PATROL_VOICE_CHANNEL_IDS}")
-    
     if not PATROL_VOICE_CHANNEL_IDS:
-        print("[VOICE ERROR] Список PATROL_VOICE_CHANNEL_IDS порожній! Перевір змінні в Railway.")
+        print("[VOICE ERROR] PATROL_VOICE_CHANNEL_IDS порожній!")
         return
 
-    # 1. Пошук каналів та перевірка наявності людей
+    # 1. Пошук каналів з людьми
     target_channels = []
-    for guild in bot.guilds:
-        for vc_channel in guild.voice_channels:
-            if vc_channel.id in PATROL_VOICE_CHANNEL_IDS:
-                humans = [m for m in vc_channel.members if not m.bot]
-                print(f"[VOICE] Знайдено канал '{vc_channel.name}' (ID: {vc_channel.id}). Людей: {len(humans)}")
-                if humans:
-                    target_channels.append(vc_channel)
+    for ch_id in PATROL_VOICE_CHANNEL_IDS:
+        ch = bot.get_channel(ch_id)
+        if ch is None:
+            try:
+                ch = await bot.fetch_channel(ch_id)
+            except Exception:
+                continue
 
-    # Якщо людей не знайдено, але канали є — підключаємося до першого налаштованого для гарантованого сповіщення
+        if isinstance(ch, discord.VoiceChannel):
+            humans = [m for m in ch.members if not m.bot]
+            if humans:
+                target_channels.append(ch)
+
     if not target_channels:
         first_id = PATROL_VOICE_CHANNEL_IDS[0]
         ch = bot.get_channel(first_id)
         if ch and isinstance(ch, discord.VoiceChannel):
-            print(f"[VOICE] У каналах пусто, але виконуємо сповіщення у головний патрульний канал: {ch.name}")
             target_channels.append(ch)
         else:
-            print("[VOICE ERROR] Не вдалося знайти жодного дійсного голосового каналу.")
+            print("[VOICE] Голосових каналів не знайдено.")
             return
 
-    # 2. Підготовка тексту і TTS
-    clean_text = re.sub(r"[•*]", "", report_text)
+    # 2. Формування тексту і генерація MP3
+    clean_text = re.sub(r"[•*#_]", "", report_text)
     speech_text = (
-        f"Увага всім екіпажам! Говорить диспетчер {disp['name']}. "
-        f"Надійшов новий виклик: {clean_text}. Прийміть картку в каналі зв'язку."
+        f"Увага всім патрулям! Говорить черговий диспетчер {disp['name']}. "
+        f"Надійшов терміновий виклик: {clean_text}. Інформація в каналі зв'язку."
     )
 
     temp_audio = f"voice_{random.randint(10000, 99999)}.mp3"
     try:
-        print(f"[VOICE] Генерація TTS через edge-tts ({disp['voice']})...")
-        communicate = edge_tts.Communicate(speech_text, disp["voice"])
+        print(f"[VOICE] Генерація TTS ({disp['voice']})...")
+        communicate = edge_tts.Communicate(speech_text, disp["voice"], rate="+5%")
         await communicate.save(temp_audio)
-        print("[VOICE] Аудіофайл успішно згенеровано.")
+        print("[VOICE] Аудіофайл створено.")
+
+        # Опції для стабільного програвання FFmpeg в Discord
+        ffmpeg_options = {
+            'options': '-vn -filter:a "volume=1.3"'
+        }
 
         for channel in target_channels:
-            print(f"[VOICE] Спроба підключення до '{channel.name}'...")
-            vc = None
+            print(f"[VOICE] Підключення до '{channel.name}'...")
             try:
-                # Перевіряємо, чи бот уже підключений до голосових на сервері
+                vc = None
                 for client in bot.voice_clients:
                     if client.guild.id == channel.guild.id:
                         vc = client
                         break
 
                 if vc is None or not vc.is_connected():
-                    vc = await channel.connect(timeout=20.0, reconnect=True)
+                    vc = await channel.connect(timeout=15.0, reconnect=True)
                 elif vc.channel.id != channel.id:
                     await vc.move_to(channel)
+
+                # Невелика пауза для синхронізації з Discord Voice Server
+                await asyncio.sleep(1.0)
 
                 if vc.is_playing():
                     vc.stop()
 
-                print(f"[VOICE] Програвання аудіо у '{channel.name}'...")
-                vc.play(discord.FFmpegPCMAudio(temp_audio))
-                
-                while vc.is_playing():
-                    await asyncio.sleep(0.5)
+                # Подія завершення відтворення
+                play_done = asyncio.Event()
 
-                print(f"[VOICE] Програвання у '{channel.name}' успішно завершено.")
+                def after_playback(error):
+                    if error:
+                        print(f"[VOICE ERROR] Помилка відтворення: {error}")
+                    bot.loop.call_soon_threadsafe(play_done.set)
+
+                audio_source = discord.FFmpegPCMAudio(temp_audio, **ffmpeg_options)
+                
+                # Обгортаємо в Transformer для стабільності бітрейту
+                audio_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
+
+                print(f"[VOICE] Початок мовлення у '{channel.name}'...")
+                vc.play(audio_source, after=after_playback)
+
+                # Чекаємо поки звук реально закінчиться (або максимум 60 сек)
+                try:
+                    await asyncio.wait_for(play_done.wait(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    print("[VOICE TIMEOUT] Таймаут програвання.")
+
+                print(f"[VOICE] Мовлення у '{channel.name}' завершено.")
                 await asyncio.sleep(1.0)
 
-            except Exception as e:
-                print(f"[VOICE ERROR] Помилка у каналі '{channel.name}': {e}")
+            except Exception as err:
+                print(f"[VOICE CHANNEL ERROR] {channel.name}: {err}")
                 log.exception("Voice Playback Exception")
 
         # Відключення
@@ -211,11 +235,11 @@ async def play_voice_alert(report_text: str, disp: dict):
                 await client.disconnect(force=True)
             except Exception:
                 pass
-        print("[VOICE] Бот відключився від усіх голосових каналів.\n--- [VOICE END] ---")
+        print("[VOICE] Бот відключився від голосових.\n--- [VOICE END] ---")
 
-    except Exception as e:
-        print(f"[VOICE CRITICAL ERROR] Загальна помилка войсу: {e}")
-        log.exception("Voice Critical Exception")
+    except Exception as err:
+        print(f"[VOICE CRITICAL ERROR]: {err}")
+        log.exception("Voice Critical")
     finally:
         if os.path.exists(temp_audio):
             try:
