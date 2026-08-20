@@ -1,5 +1,6 @@
 discord.py>=2.4
 google-genai>=1.0
+static-ffmpeg
 davey
 python-dotenv>=1.0
 edge-tts
