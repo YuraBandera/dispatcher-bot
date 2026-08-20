@@ -3,6 +3,7 @@ import random
 import asyncio
 import logging
 import re
+import shutil
 
 import discord
 from dotenv import load_dotenv
@@ -62,6 +63,21 @@ SAFETY_SETTINGS = [
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dispatcher")
+
+# ── Допоміжний пошук FFmpeg бінарника ─────────────────────────────────────────
+def get_ffmpeg_path() -> str:
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        ffmpeg_bin, _ = static_ffmpeg.run.get_or_fetch_platform_executables_else_raise()
+        if ffmpeg_bin and os.path.exists(ffmpeg_bin):
+            return ffmpeg_bin
+    except Exception as e:
+        log.warning(f"Не вдалося знайти бінарник через static_ffmpeg: {e}")
+    return "ffmpeg"
+
+FFMPEG_EXECUTABLE = get_ffmpeg_path()
 
 # ── Ініціалізація клієнтів ─────────────────────────────────────────────────
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -158,11 +174,11 @@ async def play_voice_alert(report_text: str, disp: dict):
         if ch and isinstance(ch, discord.VoiceChannel):
             target_channels.append(ch)
         else:
-            print("[VOICE] Голосових каналів не знайдено.")
+            print("[VOICE ERROR] Голосових каналів не знайдено.")
             return
 
     # 2. Формування тексту і генерація MP3
-    clean_text = re.sub(r"[•*#_]", "", report_text)
+    clean_text = re.sub(r"[•*#_`]", "", report_text)
     speech_text = (
         f"Увага всім патрулям! Говорить черговий диспетчер {disp['name']}. "
         f"Надійшов терміновий виклик: {clean_text}. Інформація в каналі зв'язку."
@@ -173,12 +189,13 @@ async def play_voice_alert(report_text: str, disp: dict):
         print(f"[VOICE] Генерація TTS ({disp['voice']})...")
         communicate = edge_tts.Communicate(speech_text, disp["voice"], rate="+5%")
         await communicate.save(temp_audio)
-        print("[VOICE] Аудіофайл створено.")
 
-        # Опції для стабільного програвання FFmpeg в Discord
-        ffmpeg_options = {
-            'options': '-vn -filter:a "volume=1.3"'
-        }
+        file_size = os.path.getsize(temp_audio) if os.path.exists(temp_audio) else 0
+        print(f"[VOICE] Аудіофайл створено ({file_size} байт).")
+
+        if file_size == 0:
+            print("[VOICE ERROR] Аудіофайл нульового розміру!")
+            return
 
         for channel in target_channels:
             print(f"[VOICE] Підключення до '{channel.name}'...")
@@ -190,12 +207,12 @@ async def play_voice_alert(report_text: str, disp: dict):
                         break
 
                 if vc is None or not vc.is_connected():
-                    vc = await channel.connect(timeout=15.0, reconnect=True)
+                    vc = await channel.connect(timeout=20.0, reconnect=True)
                 elif vc.channel.id != channel.id:
                     await vc.move_to(channel)
 
-                # Невелика пауза для синхронізації з Discord Voice Server
-                await asyncio.sleep(1.0)
+                # Невелика пауза для стабілізації Voice Handshake
+                await asyncio.sleep(1.5)
 
                 if vc.is_playing():
                     vc.stop()
@@ -205,31 +222,34 @@ async def play_voice_alert(report_text: str, disp: dict):
 
                 def after_playback(error):
                     if error:
-                        print(f"[VOICE ERROR] Помилка відтворення: {error}")
+                        print(f"[VOICE ERROR CALLBACK] Помилка відтворення: {error}")
+                    else:
+                        print(f"[VOICE] Аудіо успішно зіграно в '{channel.name}'.")
                     bot.loop.call_soon_threadsafe(play_done.set)
 
-                audio_source = discord.FFmpegPCMAudio(temp_audio, **ffmpeg_options)
-                
-                # Обгортаємо в Transformer для стабільності бітрейту
+                audio_source = discord.FFmpegPCMAudio(
+                    temp_audio,
+                    executable=FFMPEG_EXECUTABLE,
+                    options='-vn -filter:a "volume=1.3"'
+                )
                 audio_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
 
                 print(f"[VOICE] Початок мовлення у '{channel.name}'...")
                 vc.play(audio_source, after=after_playback)
 
-                # Чекаємо поки звук реально закінчиться (або максимум 60 сек)
+                # Чекаємо поки звук реально закінчиться
                 try:
                     await asyncio.wait_for(play_done.wait(), timeout=60.0)
                 except asyncio.TimeoutError:
                     print("[VOICE TIMEOUT] Таймаут програвання.")
 
-                print(f"[VOICE] Мовлення у '{channel.name}' завершено.")
                 await asyncio.sleep(1.0)
 
             except Exception as err:
                 print(f"[VOICE CHANNEL ERROR] {channel.name}: {err}")
                 log.exception("Voice Playback Exception")
 
-        # Відключення
+        # Відключення від войсів
         for client in list(bot.voice_clients):
             try:
                 await client.disconnect(force=True)
@@ -248,8 +268,54 @@ async def play_voice_alert(report_text: str, disp: dict):
                 pass
 
 
+async def monitor_callout_lifecycle(report_message: discord.Message, report: str):
+    try:
+        # 1. Очікування взяття виклику патрулем
+        def check_take(reaction: discord.Reaction, user: discord.User):
+            return (
+                reaction.message.id == report_message.id
+                and str(reaction.emoji) == "✅"
+                and not user.bot
+            )
+
+        reaction, officer = await bot.wait_for("reaction_add", check=check_take)
+
+        # Оновлення картки: виклик у роботі
+        await report_message.clear_reactions()
+        await report_message.edit(
+            content=(
+                f"🟡 **ВИКЛИК В РОБОТІ: {officer.mention}**\n\n"
+                f"{report}\n\n"
+                f"*(Після завершення ситуації натисніть 🏁 для закриття картки)*"
+            )
+        )
+        await report_message.add_reaction("🏁")
+
+        # 2. Очікування закриття виклику
+        def check_finish(reaction: discord.Reaction, user: discord.User):
+            return (
+                reaction.message.id == report_message.id
+                and str(reaction.emoji) == "🏁"
+                and not user.bot
+            )
+
+        finish_reaction, closing_officer = await bot.wait_for("reaction_add", check=check_finish)
+
+        # Фінальне оновлення картки: виклик завершено
+        await report_message.clear_reactions()
+        await report_message.edit(
+            content=(
+                f"🟢 **ВИКЛИК УСПІШНО ЗАВЕРШЕНО: {closing_officer.mention}**\n\n"
+                f"{report}\n\n"
+                f"*(Картку переміщено в архів)*"
+            )
+        )
+    except Exception as e:
+        log.error(f"Помилка в життєвому циклі картки {report_message.id}: {e}")
+
+
 async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, mention: str | None):
-    # 1. Відповідь громадянину в гілку і миттєве закриття лінії
+    # 1. Відповідь громадянину в гілку і закриття лінії
     citizen_reply = (
         f"{mention or ''}\n🚔 **Інформацію прийнято та зареєстровано!** "
         f"Черговий екіпаж патрульної поліції вже направлено за вказаною адресою. "
@@ -277,46 +343,8 @@ async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, 
     )
     await report_message.add_reaction("✅")
 
-    # 4. Нескінченне очікування взяття виклику екіпажем
-    def check_take(reaction: discord.Reaction, user: discord.User):
-        return (
-            reaction.message.id == report_message.id
-            and str(reaction.emoji) == "✅"
-            and not user.bot
-        )
-
-    reaction, officer = await bot.wait_for("reaction_add", check=check_take)
-
-    # Оновлення картки: виклик в роботі
-    await report_message.clear_reactions()
-    await report_message.edit(
-        content=(
-            f"🟡 **ВИКЛИК В РОБОТІ: {officer.mention}**\n\n"
-            f"{report}\n\n"
-            f"*(Після завершення ситуації натисніть 🏁 для закриття картки)*"
-        )
-    )
-    await report_message.add_reaction("🏁")
-
-    # 5. Нескінченне очікування завершення виклику екіпажем
-    def check_finish(reaction: discord.Reaction, user: discord.User):
-        return (
-            reaction.message.id == report_message.id
-            and str(reaction.emoji) == "🏁"
-            and not user.bot
-        )
-
-    finish_reaction, closing_officer = await bot.wait_for("reaction_add", check=check_finish)
-
-    # Фінальне оновлення картки: виклик завершено
-    await report_message.clear_reactions()
-    await report_message.edit(
-        content=(
-            f"🟢 **ВИКЛИК УСПІШНО ЗАВЕРШЕНО: {closing_officer.mention}**\n\n"
-            f"{report}\n\n"
-            f"*(Картку переміщено в архів)*"
-        )
-    )
+    # 4. Фоновий запуск відстеження реакцій (щоб бот не блокував інші виклики)
+    asyncio.create_task(monitor_callout_lifecycle(report_message, report))
 
 
 async def process_turn(thread: discord.Thread, user_text: str, mention: str | None):
