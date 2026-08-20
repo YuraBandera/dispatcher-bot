@@ -20,11 +20,17 @@ FACTION_CHANNEL_ID = int(os.getenv("FACTION_CHANNEL_ID", "0"))
 ROLE_ID_TO_PING    = int(os.getenv("ROLE_ID_TO_PING", "0"))
 GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Список ID голосових каналів через кому (наприклад: "111,222,333,444")
+# 4 окремі змінні для кожного голосового каналу патрулювання
+_voice_raw = [
+    os.getenv("PATROL_VOICE_CHANNEL_1", ""),
+    os.getenv("PATROL_VOICE_CHANNEL_2", ""),
+    os.getenv("PATROL_VOICE_CHANNEL_3", ""),
+    os.getenv("PATROL_VOICE_CHANNEL_4", ""),
+]
+
+# Автоматично збираємо валідні числові ID у список
 PATROL_VOICE_CHANNEL_IDS = [
-    int(ch_id.strip())
-    for ch_id in os.getenv("PATROL_VOICE_CHANNEL_IDS", "").split(",")
-    if ch_id.strip().isdigit()
+    int(ch_id.strip()) for ch_id in _voice_raw if ch_id.strip().isdigit()
 ]
 
 COMPLETION_TAG   = "[ВИКЛИК_ЗАВЕРШЕНО]"
@@ -149,7 +155,7 @@ async def play_voice_alert(report_text: str, disp: dict):
     if not PATROL_VOICE_CHANNEL_IDS:
         return
 
-    # Відбираємо тільки ті канали, де є живі користувачі (не боти)
+    # Відбираємо канали, де є живі користувачі (не боти)
     active_channels: list[discord.VoiceChannel] = []
     for channel_id in PATROL_VOICE_CHANNEL_IDS:
         ch = bot.get_channel(channel_id)
@@ -234,7 +240,7 @@ async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, 
     try:
         reaction, user = await bot.wait_for("reaction_add", timeout=REACTION_TIMEOUT, check=check_reaction)
 
-        # Сценарій 1: Патрульний прийняв виклик
+        # Патрульний прийняв виклик
         await report_message.edit(
             content=f"🟢 **ВИКЛИК ПРИЙНЯТО: {user.mention}**\n\n{report}"
         )
@@ -246,7 +252,7 @@ async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, 
         log.info("Виклик у гілці %s прийняв співробітник %s.", thread.id, user.display_name)
 
     except asyncio.TimeoutError:
-        # Сценарій 2: Таймаут 2 хвилини (немає реакції)
+        # Таймаут 2 хвилини
         await report_message.edit(
             content=f"🔴 **НЕМАЄ РЕАГУВАННЯ (ТАЙМАУТ)**\n\n{report}"
         )
@@ -289,13 +295,11 @@ async def process_turn(thread: discord.Thread, user_text: str, mention: str | No
         disp = session["dispatcher"]
         hung_up = "*Скинув слухавку.*" if disp["gender"] == "male" else "*Скинула слухавку.*"
 
-        # Виклик успішно зібрано
         if COMPLETION_TAG in reply:
             report = reply.replace(COMPLETION_TAG, "").strip()
             await thread.send(f"Інформацію прийнято, формую картку виклику та передаю вільним екіпажам... {hung_up}")
             asyncio.create_task(handle_call_dispatch(thread, report, disp, mention))
 
-        # Хибний виклик або відхилення
         elif INVALID_TAG in reply:
             msg = reply.replace(INVALID_TAG, "").strip()
             if msg:
@@ -307,7 +311,6 @@ async def process_turn(thread: discord.Thread, user_text: str, mention: str | No
                 pass
             sessions.pop(thread.id, None)
 
-        # Звичайна репліка в діалозі
         else:
             prefix = f"{mention}\n" if mention else ""
             await thread.send(prefix + reply)
@@ -323,7 +326,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # 1. Повідомлення в каналі викликів -> створення нової гілки
+    # Повідомлення в каналі викликів -> створення нової гілки
     if message.channel.id == CALLS_CHANNEL_ID:
         try:
             thread = await message.create_thread(
@@ -344,7 +347,7 @@ async def on_message(message: discord.Message):
         await process_turn(thread, message.content or "Алло, поліція?", message.author.mention)
         return
 
-    # 2. Повідомлення всередині активної гілки
+    # Повідомлення всередині активної гілки
     if isinstance(message.channel, discord.Thread) and message.channel.id in sessions:
         await process_turn(message.channel, message.content, None)
 
