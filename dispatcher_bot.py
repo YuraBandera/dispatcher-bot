@@ -1,4 +1,5 @@
 import os
+import io
 import random
 import asyncio
 import logging
@@ -120,13 +121,6 @@ def generate_system_prompt(disp: dict) -> str:
 • ПОСТРАЖДАЛІ / ЗАГРОЗА: [Інформація про людей/зброю]
 • ДИСПЕТЧЕР: {disp['name']} ({disp['callsign']})"""
 
-# ── Примітка щодо відтворення аудіо у вашому коді ─────────────────────────
-# Там, де у вас викликається програвання звуку (метод vc.play), 
-# замість звичайного discord.FFmpegPCMAudio обов'язково використовуйте:
-# 
-# source = await discord.FFmpegOpusAudio.from_probe("шлях_до_файлу.mp3")
-# vc.play(source)
-
 
 def new_chat_session():
     is_male = random.choice([True, False])
@@ -148,13 +142,57 @@ async def ask_gemini(chat, text: str) -> str:
     return (response.text or "").strip()
 
 
+# ── Голос: формування тексту, синтез і відтворення ─────────────────────────
+
+async def compose_radio_announcement(report: str, disp: dict) -> str:
+    """Диспетчер сам формулює коротке усне радіозвернення за карткою виклику."""
+    gender_word = "чоловік" if disp["gender"] == "male" else "жінка"
+    instruction = (
+        f"Ти — диспетчер {disp['name']}, позивний {disp['callsign']}, стать: {gender_word}. "
+        "Сформулюй КОРОТКЕ (2–3 речення) усне радіозвернення до патрульних екіпажів по гучному зв'язку "
+        "за наведеною карткою виклику. Українською мовою, від першої особи, у правильному роді, діловим тоном. "
+        "Поверни ЛИШЕ текст звернення — без тегів, розмітки, зірочок, крапок-маркерів та емодзі.\n\n"
+        f"Картка виклику:\n{report}"
+    )
+    try:
+        response = await genai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=instruction,
+            config=types.GenerateContentConfig(safety_settings=SAFETY_SETTINGS, temperature=0.7),
+        )
+        text = re.sub(r"[•*#_`]", "", (response.text or "")).strip()
+        if text:
+            return text
+    except Exception:
+        log.exception("[VOICE] Не вдалося згенерувати текст звернення — використовую шаблон.")
+
+    clean = re.sub(r"[•*#_`]", "", report).strip()
+    return (
+        f"Увага всім патрулям! Говорить черговий диспетчер {disp['name']}. "
+        f"Надійшов терміновий виклик. {clean}. Інформація в каналі зв'язку."
+    )
+
+
+async def synthesize_speech_bytes(text: str, voice: str) -> bytes:
+    """Синтезує мовлення через edge-tts прямо в пам'ять (без mp3-файлу на диску)."""
+    try:
+        buffer = bytearray()
+        communicate = edge_tts.Communicate(text, voice, rate="+5%")
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buffer.extend(chunk["data"])
+        return bytes(buffer)
+    except Exception:
+        log.exception("[VOICE] Помилка синтезу мовлення (edge-tts).")
+        return b""
+
+
 async def play_voice_alert(report_text: str, disp: dict):
-    print("\n--- [VOICE START] Початок обробки войсу ---")
     if not PATROL_VOICE_CHANNEL_IDS:
-        print("[VOICE ERROR] PATROL_VOICE_CHANNEL_IDS порожній!")
+        log.info("[VOICE] PATROL_VOICE_CHANNEL_* не задані — озвучення пропущено.")
         return
 
-    # 1. Пошук каналів з реальними людьми
+    # 1. Беремо тільки ті канали, де Є живі люди. Порожні — ігноруємо повністю.
     target_channels = []
     for ch_id in PATROL_VOICE_CHANNEL_IDS:
         ch = bot.get_channel(ch_id)
@@ -163,104 +201,70 @@ async def play_voice_alert(report_text: str, disp: dict):
                 ch = await bot.fetch_channel(ch_id)
             except Exception:
                 continue
-
-        if isinstance(ch, discord.VoiceChannel):
-            humans = [m for m in ch.members if not m.bot]
-            if humans:
-                target_channels.append(ch)
+        if isinstance(ch, discord.VoiceChannel) and any(not m.bot for m in ch.members):
+            target_channels.append(ch)
 
     if not target_channels:
-        first_id = PATROL_VOICE_CHANNEL_IDS[0]
-        ch = bot.get_channel(first_id)
-        if ch and isinstance(ch, discord.VoiceChannel):
-            target_channels.append(ch)
-        else:
-            print("[VOICE ERROR] Голосових каналів не знайдено.")
-            return
+        log.info("[VOICE] У патрульних каналах немає людей — бот у voice не заходить.")
+        return
 
-    # 2. Формування тексту та генерація TTS
-    clean_text = re.sub(r"[•*#_`]", "", report_text)
-    speech_text = (
-        f"Увага всім патрулям! Говорить черговий диспетчер {disp['name']}. "
-        f"Надійшов терміновий виклик: {clean_text}. Інформація в каналі зв'язку."
-    )
+    # 2. Диспетчер сам формулює звернення, синтезуємо його один раз у пам'ять.
+    speech_text = await compose_radio_announcement(report_text, disp)
+    audio_bytes = await synthesize_speech_bytes(speech_text, disp["voice"])
+    if not audio_bytes:
+        log.warning("[VOICE] Порожнє аудіо — озвучення скасовано.")
+        return
 
-    temp_audio = f"voice_{random.randint(10000, 99999)}.mp3"
-    try:
-        print(f"[VOICE] Генерація TTS ({disp['voice']})...")
-        communicate = edge_tts.Communicate(speech_text, disp["voice"], rate="+5%")
-        await communicate.save(temp_audio)
+    log.info("[VOICE] Озвучення (%s) у %d канал(ах).", disp["voice"], len(target_channels))
 
-        ffmpeg_bin = get_ffmpeg_executable()
-        print(f"[VOICE] Використовується бінарник FFmpeg: {ffmpeg_bin}")
+    # 3. По черзі заходимо в кожен канал з людьми й програємо звернення.
+    for channel in target_channels:
+        try:
+            vc = next((c for c in bot.voice_clients if c.guild.id == channel.guild.id), None)
+            if vc is None or not vc.is_connected():
+                vc = await channel.connect(timeout=20.0, reconnect=True)
+            elif vc.channel.id != channel.id:
+                await vc.move_to(channel)
 
-        for channel in target_channels:
-            print(f"[VOICE] Спроба підключення до '{channel.name}'...")
+            await asyncio.sleep(1.0)
+            if vc.is_playing():
+                vc.stop()
+
+            play_done = asyncio.Event()
+
+            def after_playback(error):
+                if error:
+                    log.error("[VOICE] Помилка відтворення: %s", error)
+                bot.loop.call_soon_threadsafe(play_done.set)
+
+            # Стрімимо байти напряму в FFmpeg через stdin — жодних файлів на диску.
+            source = discord.FFmpegPCMAudio(
+                io.BytesIO(audio_bytes),
+                pipe=True,
+                options='-filter:a "volume=1.3"',
+            )
+            vc.play(source, after=after_playback)
+
             try:
-                vc = None
-                for client in bot.voice_clients:
-                    if client.guild.id == channel.guild.id:
-                        vc = client
-                        break
+                await asyncio.wait_for(play_done.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                log.warning("[VOICE] Таймаут відтворення у '%s'.", channel.name)
 
-                if vc is None or not vc.is_connected():
-                    vc = await channel.connect(timeout=20.0, reconnect=True)
-                elif vc.channel.id != channel.id:
-                    await vc.move_to(channel)
+            await asyncio.sleep(0.5)
 
-                await asyncio.sleep(1.0)
+        except Exception:
+            log.exception("[VOICE] Помилка у каналі '%s'.", getattr(channel, "name", "?"))
 
-                if vc.is_playing():
-                    vc.stop()
+    # 4. Відключаємося з усіх голосових каналів.
+    for client in list(bot.voice_clients):
+        try:
+            await client.disconnect(force=True)
+        except Exception:
+            pass
+    log.info("[VOICE] Бот відключився від голосових каналів.")
 
-                play_done = asyncio.Event()
 
-                def after_playback(error):
-                    if error:
-                        print(f"[VOICE ERROR] Помилка відтворення: {error}")
-                    else:
-                        print(f"[VOICE] Відтворення успішно завершено.")
-                    bot.loop.call_soon_threadsafe(play_done.set)
-
-                audio_source = discord.FFmpegOpusAudio.from_probe(
-                    temp_audio,
-                    executable=ffmpeg_bin,
-                    options='-vn -filter:a "volume=1.3"'
-                )
-                audio_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
-
-                print(f"[VOICE] Програвання аудіо у '{channel.name}'...")
-                vc.play(audio_source, after=after_playback)
-
-                try:
-                    await asyncio.wait_for(play_done.wait(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    print("[VOICE TIMEOUT] Таймаут програвання.")
-
-                await asyncio.sleep(1.0)
-
-            except Exception as err:
-                print(f"[VOICE ERROR] Помилка у каналі '{channel.name}': {err}")
-                log.exception("Voice Playback Exception")
-
-        # Відключення
-        for client in list(bot.voice_clients):
-            try:
-                await client.disconnect(force=True)
-            except Exception:
-                pass
-        print("[VOICE] Бот відключився від усіх голосових каналів.\n--- [VOICE END] ---")
-
-    except Exception as err:
-        print(f"[VOICE CRITICAL ERROR]: {err}")
-        log.exception("Voice Critical")
-    finally:
-        if os.path.exists(temp_audio):
-            try:
-                os.remove(temp_audio)
-            except OSError:
-                pass
-
+# ── Життєвий цикл картки виклику у фракційному каналі ──────────────────────
 
 async def monitor_callout_lifecycle(report_message: discord.Message, report: str):
     try:
@@ -317,10 +321,11 @@ async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, 
         pass
     sessions.pop(thread.id, None)
 
-    # Голосове сповіщення
+    # Голосове сповіщення (окремою задачею, щоб не блокувати інші виклики).
+    # Всередині сам вирішить: якщо в патрульних каналах нікого немає — не заходить у voice.
     asyncio.create_task(play_voice_alert(report, disp))
 
-    # Текстова картка у фракційний канал
+    # Текстова картка у фракційний канал — публікується завжди, незалежно від голосу.
     faction_channel = bot.get_channel(FACTION_CHANNEL_ID)
     if faction_channel is None:
         faction_channel = await bot.fetch_channel(FACTION_CHANNEL_ID)
@@ -424,3 +429,4 @@ if __name__ == "__main__":
     if missing:
         raise SystemExit(f"Не заповнені змінні оточення: {', '.join(missing)}")
     bot.run(DISCORD_TOKEN)
+
