@@ -16,7 +16,6 @@ import static_ffmpeg
 static_ffmpeg.add_paths()
 
 # ── Завантаження Opus для голосових функцій ─────────────────────────────────
-# Цей блок примусово завантажує Opus у Linux / Docker системах
 if not discord.opus.is_loaded():
     _opus_candidates = ['libopus.so.0', 'libopus.so', 'libopus', 'opus']
     _found = ctypes.util.find_library('opus')
@@ -45,13 +44,23 @@ _voice_raw = [
     os.getenv("PATROL_VOICE_CHANNEL_3", ""),
     os.getenv("PATROL_VOICE_CHANNEL_4", ""),
 ]
-
 PATROL_VOICE_CHANNEL_IDS = [
     int(ch_id.strip()) for ch_id in _voice_raw if ch_id.strip().isdigit()
 ]
 
 COMPLETION_TAG = "[ВИКЛИК_ЗАВЕРШЕНО]"
 INVALID_TAG    = "[ВИКЛИК_СКАСОВАНО]"
+
+# Сигнали реагування (реакції під карткою у фракційному каналі)
+EMOJI_ACCEPT = "✅"   # екіпаж прийняв виклик
+EMOJI_BUSY   = "⛔"   # екіпаж зайнятий / недоступний
+EMOJI_FINISH = "🏁"   # виклик завершено
+
+ACCEPT_TIMEOUT = 180    # скільки чекати ✅/⛔ від екіпажу, сек
+FINISH_TIMEOUT = 1800   # скільки чекати 🏁 після прийняття, сек (авто-відбій)
+
+# Бот один — не може бути у двох войсах одночасно. Голосові виклики опрацьовуємо по черзі.
+VOICE_LOCK = asyncio.Lock()
 
 DISPATCHERS_MALE = [
     {"name": "Олексій Ткаченко", "callsign": "102-Альфа", "role_desc": "черговий диспетчер", "voice": "uk-UA-OstapNeural", "gender": "male"},
@@ -169,42 +178,12 @@ async def ask_gemini(chat, text: str) -> str:
     return (response.text or "").strip()
 
 
-# ── Голос: формування тексту, синтез і відтворення ─────────────────────────
-
-async def compose_radio_announcement(report: str, disp: dict) -> str:
-    """Диспетчер сам формулює коротке усне радіозвернення за карткою виклику."""
-    gender_word = "чоловік" if disp["gender"] == "male" else "жінка"
-    instruction = (
-        f"Ти — диспетчер {disp['name']}, позивний {disp['callsign']}, стать: {gender_word}. "
-        "Сформулюй КОРОТКЕ (2–3 речення) усне радіозвернення до патрульних екіпажів по гучному зв'язку "
-        "за наведеною карткою виклику. Українською мовою, від першої особи, у правильному роді, діловим тоном. "
-        "Поверни ЛИШЕ текст звернення — без тегів, розмітки, зірочок, крапок-маркерів та емодзі.\n\n"
-        f"Картка виклику:\n{report}"
-    )
-    try:
-        response = await genai_client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=instruction,
-            config=types.GenerateContentConfig(safety_settings=SAFETY_SETTINGS, temperature=0.7),
-        )
-        text = re.sub(r"[•*#_`]", "", (response.text or "")).strip()
-        if text:
-            return text
-    except Exception:
-        log.exception("[VOICE] Не вдалося згенерувати текст звернення — використовую шаблон.")
-
-    clean = re.sub(r"[•*#_`]", "", report).strip()
-    return (
-        f"Увага всім патрулям! Говорить черговий диспетчер {disp['name']}. "
-        f"Надійшов терміновий виклик. {clean}. Інформація в каналі зв'язку."
-    )
-
+# ── Синтез мовлення (edge-tts прямо в пам'ять, без mp3-файлів) ─────────────
 
 async def synthesize_speech_bytes(text: str, voice: str) -> bytes:
-    """Синтезує мовлення через edge-tts прямо в пам'ять (без mp3-файлу на диску)."""
     try:
         buffer = bytearray()
-        communicate = edge_tts.Communicate(text, voice, rate="+5%")
+        communicate = edge_tts.Communicate(text, voice)  # без rate — природніший темп
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 buffer.extend(chunk["data"])
@@ -214,163 +193,241 @@ async def synthesize_speech_bytes(text: str, voice: str) -> bytes:
         return b""
 
 
-async def play_voice_alert(report_text: str, disp: dict):
-    if not PATROL_VOICE_CHANNEL_IDS:
-        log.info("[VOICE] PATROL_VOICE_CHANNEL_* не задані — озвучення пропущено.")
-        return
+async def compose_announcement_audio(report: str, disp: dict) -> bytes:
+    """Диспетчер сам формулює живе радіозвернення, одразу синтезуємо його в аудіо."""
+    gender_word = "чоловік" if disp["gender"] == "male" else "жінка"
+    instruction = (
+        f"Ти — диспетчер {disp['name']}, позивний {disp['callsign']}, стать: {gender_word}. "
+        "Сформулюй КОРОТКЕ (2–3 речення) усне радіозвернення до патрульних екіпажів по гучному зв'язку "
+        "за наведеною карткою виклику. Українською, від першої особи, у правильному роді, живим діловим тоном. "
+        "Поверни ЛИШЕ текст звернення — без тегів, розмітки, зірочок, маркерів та емодзі.\n\n"
+        f"Картка виклику:\n{report}"
+    )
+    speech_text = None
+    try:
+        response = await genai_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=instruction,
+            config=types.GenerateContentConfig(safety_settings=SAFETY_SETTINGS, temperature=0.7),
+        )
+        speech_text = re.sub(r"[•*#_`]", "", (response.text or "")).strip()
+    except Exception:
+        log.exception("[VOICE] Не вдалося згенерувати текст звернення — використовую шаблон.")
 
-    # 1. Беремо тільки ті канали, де Є живі люди. Порожні — ігноруємо повністю.
-    target_channels = []
+    if not speech_text:
+        clean = re.sub(r"[•*#_`]", "", report).strip()
+        speech_text = (
+            f"Увага всім патрулям! Говорить черговий диспетчер {disp['name']}. "
+            f"Надійшов терміновий виклик. {clean}. Інформація в каналі зв'язку."
+        )
+    return await synthesize_speech_bytes(speech_text, disp["voice"])
+
+
+# ── Робота з голосом ───────────────────────────────────────────────────────
+
+def find_crew_channel() -> discord.VoiceChannel | None:
+    """Перший патрульний канал, де є хоч одна жива людина."""
     for ch_id in PATROL_VOICE_CHANNEL_IDS:
         ch = bot.get_channel(ch_id)
-        if ch is None:
-            try:
-                ch = await bot.fetch_channel(ch_id)
-            except Exception:
-                continue
         if isinstance(ch, discord.VoiceChannel) and any(not m.bot for m in ch.members):
-            target_channels.append(ch)
+            return ch
+    return None
 
-    if not target_channels:
-        log.info("[VOICE] У патрульних каналах немає людей — бот у voice не заходить.")
+
+async def connect_to(channel: discord.VoiceChannel) -> discord.VoiceClient:
+    vc = next((c for c in bot.voice_clients if c.guild.id == channel.guild.id), None)
+    if vc is None or not vc.is_connected():
+        vc = await channel.connect(timeout=20.0, reconnect=True)
+    elif vc.channel.id != channel.id:
+        await vc.move_to(channel)
+    return vc
+
+
+async def play_audio_bytes(vc: discord.VoiceClient, audio_bytes: bytes):
+    if not vc or not audio_bytes:
         return
+    play_done = asyncio.Event()
 
-    # 2. Диспетчер сам формулює звернення, синтезуємо його один раз у пам'ять.
-    speech_text = await compose_radio_announcement(report_text, disp)
-    audio_bytes = await synthesize_speech_bytes(speech_text, disp["voice"])
-    if not audio_bytes:
-        log.warning("[VOICE] Порожнє аудіо — озвучення скасовано.")
-        return
+    def after_playback(error):
+        if error:
+            log.error("[VOICE] Помилка відтворення: %s", error)
+        bot.loop.call_soon_threadsafe(play_done.set)
 
-    log.info("[VOICE] Озвучення (%s) у %d канал(ах).", disp["voice"], len(target_channels))
+    if vc.is_playing():
+        vc.stop()
+    # FFmpeg кодує в Opus (libopus для кодування не потрібен); loudnorm = чистий, рівний звук.
+    source = discord.FFmpegOpusAudio(
+        io.BytesIO(audio_bytes),
+        pipe=True,
+        executable=FFMPEG_PATH,
+        bitrate=128,
+        options='-af loudnorm=I=-16:TP=-1.5:LRA=11',
+    )
+    vc.play(source, after=after_playback)
+    try:
+        await asyncio.wait_for(play_done.wait(), timeout=60.0)
+    except asyncio.TimeoutError:
+        log.warning("[VOICE] Таймаут відтворення.")
 
-    # 3. По черзі заходимо в кожен канал з людьми й програємо звернення.
-    for channel in target_channels:
-        try:
-            vc = next((c for c in bot.voice_clients if c.guild.id == channel.guild.id), None)
-            if vc is None or not vc.is_connected():
-                log.info("[VOICE] Підключаюсь до '%s'...", channel.name)
-                vc = await channel.connect(timeout=20.0, reconnect=True)
-            elif vc.channel.id != channel.id:
-                await vc.move_to(channel)
 
-            await asyncio.sleep(1.0)
-            if vc.is_playing():
-                vc.stop()
+async def speak(vc: discord.VoiceClient, text: str, voice: str):
+    """Синтез + програвання короткої службової фрази."""
+    await play_audio_bytes(vc, await synthesize_speech_bytes(text, voice))
 
-            play_done = asyncio.Event()
 
-            def after_playback(error):
-                if error:
-                    log.error("[VOICE] Помилка відтворення: %s", error)
-                else:
-                    log.info("[VOICE] Відтворення завершено у '%s'.", channel.name)
-                bot.loop.call_soon_threadsafe(play_done.set)
-
-            # FFmpeg сам кодує в Opus → discord.py шле напряму, окремий libopus не потрібен.
-            # Стрімимо байти через stdin — жодних файлів на диску.
-            source = discord.FFmpegOpusAudio(
-                io.BytesIO(audio_bytes),
-                pipe=True,
-                executable=FFMPEG_PATH,
-                bitrate=128,
-                options='-filter:a "volume=1.3"',
-            )
-            log.info("[VOICE] Програю звернення у '%s'...", channel.name)
-            vc.play(source, after=after_playback)
-
-            try:
-                await asyncio.wait_for(play_done.wait(), timeout=60.0)
-            except asyncio.TimeoutError:
-                log.warning("[VOICE] Таймаут відтворення у '%s'.", channel.name)
-
-            await asyncio.sleep(0.5)
-
-        except Exception:
-            log.exception("[VOICE] Помилка у каналі '%s'.", getattr(channel, "name", "?"))
-
-    # 4. Відключаємося з усіх голосових каналів.
+async def disconnect_all():
     for client in list(bot.voice_clients):
         try:
             await client.disconnect(force=True)
         except Exception:
             pass
-    log.info("[VOICE] Бот відключився від голосових каналів.")
 
 
-# ── Життєвий цикл картки виклику у фракційному каналі ──────────────────────
-
-async def monitor_callout_lifecycle(report_message: discord.Message, report: str):
+async def wait_for_reaction(message: discord.Message, emojis: set[str], timeout: float | None):
+    """Чекаємо будь-яку з реакцій emojis на message. Повертає (емодзі, користувач) або (None, None)."""
+    def check(reaction: discord.Reaction, user: discord.User):
+        return (
+            reaction.message.id == message.id
+            and str(reaction.emoji) in emojis
+            and not user.bot
+        )
     try:
-        def check_take(reaction: discord.Reaction, user: discord.User):
-            return (
-                reaction.message.id == report_message.id
-                and str(reaction.emoji) == "✅"
-                and not user.bot
-            )
-
-        reaction, officer = await bot.wait_for("reaction_add", check=check_take)
-
-        await report_message.clear_reactions()
-        await report_message.edit(
-            content=(
-                f"🟡 **ВИКЛИК В РОБОТІ: {officer.mention}**\n\n"
-                f"{report}\n\n"
-                f"*(Після завершення ситуації натисніть 🏁 для закриття картки)*"
-            )
-        )
-        await report_message.add_reaction("🏁")
-
-        def check_finish(reaction: discord.Reaction, user: discord.User):
-            return (
-                reaction.message.id == report_message.id
-                and str(reaction.emoji) == "🏁"
-                and not user.bot
-            )
-
-        finish_reaction, closing_officer = await bot.wait_for("reaction_add", check=check_finish)
-
-        await report_message.clear_reactions()
-        await report_message.edit(
-            content=(
-                f"🟢 **ВИКЛИК УСПІШНО ЗАВЕРШЕНО: {closing_officer.mention}**\n\n"
-                f"{report}\n\n"
-                f"*(Картку переміщено в архів)*"
-            )
-        )
-    except Exception as e:
-        log.error(f"Помилка в життєвому циклі картки {report_message.id}: {e}")
+        reaction, user = await bot.wait_for("reaction_add", check=check, timeout=timeout)
+        return str(reaction.emoji), user
+    except asyncio.TimeoutError:
+        return None, None
 
 
-async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, mention: str | None):
-    citizen_reply = (
-        f"{mention or ''}\n🚔 **Інформацію прийнято та зареєстровано!** "
-        f"Черговий екіпаж патрульної поліції вже направлено за вказаною адресою. "
-        f"Залишайтеся в безпечному місці та очікуйте на прибуття співробітників."
-    )
-    await thread.send(citizen_reply)
+async def close_thread_with(thread: discord.Thread, text: str):
+    try:
+        await thread.send(text)
+    except discord.HTTPException:
+        pass
     try:
         await thread.edit(archived=True, locked=True)
     except discord.HTTPException:
         pass
+
+
+# ── Головний цикл виклику: голос + очікування реагування ───────────────────
+
+async def run_callout(faction_message: discord.Message, report: str, disp: dict, thread: discord.Thread, mention: str | None):
+    voice = disp["voice"]
+    # Бот один — тримаємо один голосовий цикл за раз, щоб виклики не билися за войс.
+    async with VOICE_LOCK:
+        vc = None
+        try:
+            crew = find_crew_channel()
+
+            if crew:
+                # Пришвидшення: паралельно підключаємось і готуємо аудіо звернення.
+                log.info("[VOICE] Екіпаж у '%s' — підключаюсь і готую звернення...", crew.name)
+                connect_task = asyncio.create_task(connect_to(crew))
+                audio_task = asyncio.create_task(compose_announcement_audio(report, disp))
+                try:
+                    vc, announce_audio = await asyncio.gather(connect_task, audio_task)
+                except Exception:
+                    log.exception("[VOICE] Помилка підключення/підготовки аудіо.")
+                    vc, announce_audio = None, b""
+                if vc:
+                    await asyncio.sleep(0.4)  # даємо голосовому каналу «прогрітись»
+                    await play_audio_bytes(vc, announce_audio)
+            else:
+                log.info("[VOICE] У войсах нікого — працюємо лише текстом.")
+
+            # Чекаємо сигнал від екіпажу: ✅ прийнято або ⛔ зайняті/недоступні.
+            emoji, officer = await wait_for_reaction(
+                faction_message, {EMOJI_ACCEPT, EMOJI_BUSY}, ACCEPT_TIMEOUT
+            )
+
+            # ── Екіпаж зайнятий / недоступний ──────────────────────────────
+            if emoji == EMOJI_BUSY:
+                await faction_message.clear_reactions()
+                await faction_message.edit(content=f"🔴 **ЕКІПАЖ ЗАЙНЯТИЙ / НЕДОСТУПНИЙ**\n\n{report}")
+                if vc:
+                    await speak(vc, "Зрозуміло, екіпаж зайнятий. Передаю виклик далі. Відбій.", voice)
+                await close_thread_with(
+                    thread,
+                    f"{mention or ''}\n❌ **Наразі всі вільні екіпажі зайняті або відсутні на лінії.** "
+                    f"Заяву внесено до журналу обліку. За потреби зверніться до найближчого відділку поліції."
+                )
+                return
+
+            # ── Ніхто не відреагував за ACCEPT_TIMEOUT ─────────────────────
+            if emoji is None:
+                await faction_message.clear_reactions()
+                await faction_message.edit(content=f"🔴 **НЕМАЄ РЕАГУВАННЯ — ТАЙМАУТ**\n\n{report}")
+                if vc:
+                    await speak(vc, "Відповіді від екіпажу немає. Виклик лишається без реагування.", voice)
+                await close_thread_with(
+                    thread,
+                    f"{mention or ''}\n❌ **На жаль, наразі екіпажі недоступні на лінії реагування.** "
+                    f"Заяву внесено до журналу обліку. За потреби зверніться до найближчого відділку поліції."
+                )
+                return
+
+            # ── Виклик ПРИЙНЯТО (✅) ───────────────────────────────────────
+            await faction_message.clear_reactions()
+            await faction_message.edit(
+                content=(
+                    f"🟡 **ВИКЛИК В РОБОТІ: {officer.mention}**\n\n{report}\n\n"
+                    f"*(Після завершення ситуації натисніть 🏁 для закриття картки)*"
+                )
+            )
+            await faction_message.add_reaction(EMOJI_FINISH)
+            if vc:
+                await speak(vc, f"Виклик прийнято, дякую. Екіпаж на завданні. Чекаю доповідь про завершення.", voice)
+
+            # Повідомляємо заявника й закриваємо гілку — реагування підтверджено.
+            await close_thread_with(
+                thread,
+                f"{mention or ''}\n🚔 **Екіпаж патрульної поліції прийняв Ваш виклик** і прямує за вказаною адресою. "
+                f"Залишайтеся в безпечному місці та очікуйте на прибуття співробітників."
+            )
+
+            # Лишаємось на лінії й чекаємо 🏁 (з запобіжним авто-таймаутом).
+            finish_emoji, closing_officer = await wait_for_reaction(
+                faction_message, {EMOJI_FINISH}, FINISH_TIMEOUT
+            )
+            await faction_message.clear_reactions()
+            who = closing_officer.mention if closing_officer else "авто-відбій"
+            await faction_message.edit(content=f"🟢 **ВИКЛИК ЗАВЕРШЕНО: {who}**\n\n{report}")
+            if vc:
+                await speak(vc, "Виклик завершено. Дякую за роботу. Відбій.", voice)
+
+        except Exception:
+            log.exception("[VOICE] Помилка у циклі виклику.")
+        finally:
+            await disconnect_all()
+            log.info("[VOICE] Цикл виклику завершено, бот вийшов з голосового каналу.")
+
+
+async def handle_call_dispatch(thread: discord.Thread, report: str, disp: dict, mention: str | None):
+    # Опитування завершене — Gemini більше не веде цю гілку.
     sessions.pop(thread.id, None)
 
-    # Голосове сповіщення (окремою задачею, щоб не блокувати інші виклики).
-    # Всередині сам вирішить: якщо в патрульних каналах нікого немає — не заходить у voice.
-    asyncio.create_task(play_voice_alert(report, disp))
+    # Проміжне повідомлення заявнику (гілку поки НЕ закриваємо — чекаємо реагування).
+    await thread.send(
+        f"{mention or ''}\n🚔 **Виклик прийнято до опрацювання** та передано патрульним екіпажам. "
+        f"Очікуйте підтвердження реагування."
+    )
 
-    # Текстова картка у фракційний канал — публікується завжди, незалежно від голосу.
+    # Картка у фракційний канал із сигналами реагування.
     faction_channel = bot.get_channel(FACTION_CHANNEL_ID)
     if faction_channel is None:
         faction_channel = await bot.fetch_channel(FACTION_CHANNEL_ID)
 
     header = f"<@&{ROLE_ID_TO_PING}>\n🚨 **НОВИЙ ВИКЛИК 102 — ОПЕРАТИВНЕ РЕАГУВАННЯ**\n\n"
-    report_message = await faction_channel.send(
-        header + report + "\n\n*(Натисніть ✅, щоб закріпити виклик за собою)*",
-        allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True)
+    footer = "\n\n*(✅ — прийняти виклик · ⛔ — екіпаж зайнятий/недоступний)*"
+    faction_message = await faction_channel.send(
+        header + report + footer,
+        allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
     )
-    await report_message.add_reaction("✅")
-    asyncio.create_task(monitor_callout_lifecycle(report_message, report))
+    await faction_message.add_reaction(EMOJI_ACCEPT)
+    await faction_message.add_reaction(EMOJI_BUSY)
+
+    # Окремою задачею: голос + очікування реагування (не блокує нові виклики).
+    asyncio.create_task(run_callout(faction_message, report, disp, thread, mention))
 
 
 async def process_turn(thread: discord.Thread, user_text: str, mention: str | None):
