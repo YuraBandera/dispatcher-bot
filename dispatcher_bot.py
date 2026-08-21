@@ -4,6 +4,8 @@ import random
 import asyncio
 import logging
 import re
+import shutil
+import ctypes.util
 
 import discord
 from dotenv import load_dotenv
@@ -16,11 +18,15 @@ static_ffmpeg.add_paths()
 # ── Завантаження Opus для голосових функцій ─────────────────────────────────
 # Цей блок примусово завантажує Opus у Linux / Docker системах
 if not discord.opus.is_loaded():
-    for opus_lib in ['libopus.so.0', 'libopus.so', 'libopus']:
+    _opus_candidates = ['libopus.so.0', 'libopus.so', 'libopus', 'opus']
+    _found = ctypes.util.find_library('opus')
+    if _found:
+        _opus_candidates.insert(0, _found)
+    for opus_lib in _opus_candidates:
         try:
             discord.opus.load_opus(opus_lib)
             break
-        except OSError:
+        except Exception:
             continue
 
 # ── Конфігурація ───────────────────────────────────────────────────────────
@@ -73,6 +79,27 @@ SAFETY_SETTINGS = [
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dispatcher")
+
+if discord.opus.is_loaded():
+    log.info("[VOICE] Opus завантажено.")
+else:
+    log.warning("[VOICE] Opus НЕ завантажено (для FFmpegOpusAudio це не критично).")
+
+
+def resolve_ffmpeg() -> str:
+    """Знаходимо реальний шлях до ffmpeg: static_ffmpeg → системний PATH → 'ffmpeg'."""
+    try:
+        from static_ffmpeg import run as _sf_run
+        ffmpeg_path, _ = _sf_run.get_or_fetch_platform_executables_else_raise()
+        if ffmpeg_path and os.path.exists(ffmpeg_path):
+            return ffmpeg_path
+    except Exception:
+        log.warning("[VOICE] static_ffmpeg не дав шлях, пробую системний ffmpeg.")
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+FFMPEG_PATH = resolve_ffmpeg()
+log.info("[VOICE] FFmpeg executable: %s", FFMPEG_PATH)
 
 # ── Ініціалізація клієнтів ─────────────────────────────────────────────────
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -222,6 +249,7 @@ async def play_voice_alert(report_text: str, disp: dict):
         try:
             vc = next((c for c in bot.voice_clients if c.guild.id == channel.guild.id), None)
             if vc is None or not vc.is_connected():
+                log.info("[VOICE] Підключаюсь до '%s'...", channel.name)
                 vc = await channel.connect(timeout=20.0, reconnect=True)
             elif vc.channel.id != channel.id:
                 await vc.move_to(channel)
@@ -235,14 +263,20 @@ async def play_voice_alert(report_text: str, disp: dict):
             def after_playback(error):
                 if error:
                     log.error("[VOICE] Помилка відтворення: %s", error)
+                else:
+                    log.info("[VOICE] Відтворення завершено у '%s'.", channel.name)
                 bot.loop.call_soon_threadsafe(play_done.set)
 
-            # Стрімимо байти напряму в FFmpeg через stdin — жодних файлів на диску.
-            source = discord.FFmpegPCMAudio(
+            # FFmpeg сам кодує в Opus → discord.py шле напряму, окремий libopus не потрібен.
+            # Стрімимо байти через stdin — жодних файлів на диску.
+            source = discord.FFmpegOpusAudio(
                 io.BytesIO(audio_bytes),
                 pipe=True,
+                executable=FFMPEG_PATH,
+                bitrate=128,
                 options='-filter:a "volume=1.3"',
             )
+            log.info("[VOICE] Програю звернення у '%s'...", channel.name)
             vc.play(source, after=after_playback)
 
             try:
