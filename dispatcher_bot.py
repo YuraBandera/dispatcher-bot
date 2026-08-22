@@ -222,9 +222,9 @@ async def _eleven_tts(text: str, voice_id: str) -> bytes:
         "text": text,
         "model_id": ELEVEN_MODEL,
         "voice_settings": {
-            "stability": 0.4,
-            "similarity_boost": 0.75,
-            "style": 0.35,
+            "stability": 0.25,
+            "similarity_boost": 0.8,
+            "style": 0.55,
             "use_speaker_boost": True,
         },
     }
@@ -338,7 +338,6 @@ async def play_audio_bytes(vc: discord.VoiceClient, audio_bytes: bytes):
         pipe=True,
         executable=FFMPEG_PATH,
         bitrate=128,
-        options='-af loudnorm=I=-16:TP=-1.5:LRA=11',
     )
     vc.play(source, after=after_playback)
     try:
